@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
 
-from torch.autograd import Variable
 from model_search import Network
 from architect import Architect
 
@@ -24,7 +23,7 @@ parser.add_argument('--learning_rate', type=float, default=0.025, help='init lea
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')
-parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
+parser.add_argument('--report_freq', type=float, default=1, help='report frequency')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=50, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
@@ -59,7 +58,6 @@ is_cuda = torch.cuda.is_available()
 def main():
     if not is_cuda:
         logging.info('no gpu device available')
-        #sys.exit(1)
 
     np.random.seed(args.seed)
     if is_cuda:
@@ -82,7 +80,6 @@ def main():
 
     optimizer = torch.optim.SGD(
         [x[1] for x in filter(lambda p: 'alpha' not in p[0], model.named_parameters())],
-        #model.parameters(),
         args.learning_rate,
         momentum=args.momentum,
         weight_decay=args.weight_decay)
@@ -97,12 +94,12 @@ def main():
     train_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-        pin_memory=is_cuda, num_workers=2)
+        pin_memory=is_cuda, num_workers=0)
 
     valid_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-        pin_memory=True, num_workers=2)
+        pin_memory=True, num_workers=0)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
@@ -140,13 +137,8 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr):
         model.train()
         n = input.size(0)
 
-        input = Variable(input, requires_grad=False)
-        target = Variable(target, requires_grad=False)
-
         # get a random minibatch from the search queue with replacement
         input_search, target_search = next(iter(valid_queue))
-        input_search = Variable(input_search, requires_grad=False)
-        target_search = Variable(target_search, requires_grad=False)
 
         if is_cuda:
             input = input.cuda()
@@ -182,8 +174,6 @@ def infer(valid_queue, model, criterion):
     model.eval()
 
     for step, (input, target) in enumerate(valid_queue):
-        input = Variable(input, volatile=True)
-        target = Variable(target, volatile=True)
         if is_cuda:
             input = input.cuda()
             target = target.cuda()
