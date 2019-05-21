@@ -14,11 +14,10 @@ import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
 
 from model_search import Network
-from architect import Architect
 
 parser = argparse.ArgumentParser("cifar")
-parser.add_argument('--data', type=str, default='../data', help='location of the data corpus')
-parser.add_argument('--batch_size', type=int, default=2, help='batch size')
+parser.add_argument('--data', type=str, default='./data', help='location of the data corpus')
+parser.add_argument('--batch_size', type=int, default=256, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
@@ -61,7 +60,8 @@ def main():
 
     np.random.seed(args.seed)
     if is_cuda:
-        torch.cuda.set_device(args.gpu)
+        pass
+        #torch.cuda.set_device(args.gpu)
     cudnn.benchmark = True
     torch.manual_seed(args.seed)
     cudnn.enabled = True
@@ -83,9 +83,16 @@ def main():
         args.learning_rate,
         momentum=args.momentum,
         weight_decay=args.weight_decay)
+    
+    arch_optimizer = torch.optim.Adam(
+            [x[1] for x in filter(lambda p: 'alpha' in p[0], model.named_parameters())],
+            lr=args.arch_learning_rate, 
+            betas=(0.5, 0.999),
+            weight_decay=args.arch_weight_decay)
 
     train_transform, valid_transform = utils._data_transforms_cifar10(args)
-    train_data = dset.CIFAR10(root=args.data, train=True, download=True, transform=train_transform)
+    train_data = dset.CIFAR10(root=args.data, train=True, download=False, transform=train_transform)
+    print("len: {}".format(len(train_data)))
 
     num_train = len(train_data)
     indices = list(range(num_train))
@@ -94,41 +101,40 @@ def main():
     train_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-        pin_memory=is_cuda, num_workers=0)
+        pin_memory=is_cuda, num_workers=16)
 
     valid_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
+        train_data, batch_size=64,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-        pin_memory=True, num_workers=0)
+        pin_memory=True, num_workers=16)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
-
-    architect = Architect(model, args)
 
     for epoch in range(args.epochs):
         scheduler.step()
         lr = scheduler.get_lr()[0]
         logging.info('epoch %d lr %e', epoch, lr)
 
-        genotype = model.genotype()
+        genotype = model.module.genotype()
         logging.info('genotype = %s', genotype)
 
-        print(F.softmax(model.alphas_normal, dim=-1))
-        print(F.softmax(model.alphas_reduce, dim=-1))
+        print(F.softmax(model.module.alphas_normal, dim=-1))
+        print(F.softmax(model.module.alphas_reduce, dim=-1))
 
         # training
-        train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr)
+        train_acc, train_obj = train(train_queue, valid_queue, model, criterion, optimizer, lr, arch_optimizer)
         logging.info('train_acc %f', train_acc)
 
-        # validation
-        valid_acc, valid_obj = infer(valid_queue, model, criterion)
-        logging.info('valid_acc %f', valid_acc)
+        if epoch in [0, 10, 20, 30, 40, args.epochs - 1]:
+            # validation
+            valid_acc, valid_obj = infer(valid_queue, model, criterion)
+            logging.info('valid_acc %f', valid_acc)
 
         utils.save(model, os.path.join(args.save, 'weights.pt'))
 
 
-def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr):
+def train(train_queue, valid_queue, model, criterion, optimizer, lr, arch_optimizer):
     objs = utils.AvgrageMeter()
     top1 = utils.AvgrageMeter()
     top5 = utils.AvgrageMeter()
@@ -145,22 +151,27 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr):
             target = target.cuda(async=True)
             input_search = input_search.cuda()
             target_search = target_search.cuda(async=True)
+        
+        # update the arch
+        arch_optimizer.zero_grad()
+        arch_logits = model(input_search)
+        arch_loss = criterion(arch_logits, target_search)
+        arch_loss.backward()
+        arch_optimizer.step()
 
-        architect.step(input, target, input_search, target_search, lr, optimizer, unrolled=args.unrolled)
-
+        # update the parameters
         optimizer.zero_grad()
         logits = model(input)
         loss = criterion(logits, target)
-
         loss.backward()
         nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
         optimizer.step()
-
+        
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
         objs.update(loss.item(), n)
         top1.update(prec1.item(), n)
         top5.update(prec5.item(), n)
-
+        
         if step % args.report_freq == 0:
             logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
 
@@ -183,9 +194,9 @@ def infer(valid_queue, model, criterion):
 
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
         n = input.size(0)
-        objs.update(loss.data[0], n)
-        top1.update(prec1.data[0], n)
-        top5.update(prec5.data[0], n)
+        objs.update(loss.item(), n)
+        top1.update(prec1.item(), n)
+        top5.update(prec5.item(), n)
 
         if step % args.report_freq == 0:
             logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
